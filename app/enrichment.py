@@ -48,8 +48,33 @@ HEADERS = {
 IMPORTANT_PATTERNS = {
     "contact": ["contact", "support", "reach-us", "get-in-touch"],
     "about": ["about", "company", "who-we-are", "our-story"],
-    "services": ["services", "solutions", "products", "platform", "industries", "what-we-do"],
+    "services": [
+        "services",
+        "solutions",
+        "products",
+        "platform",
+        "industries",
+        "what-we-do",
+        "features",
+        "marketplace",
+        "pricing",
+    ],
 }
+
+FALLBACK_PATHS = [
+    "about",
+    "company",
+    "contact",
+    "support",
+    "services",
+    "solutions",
+    "products",
+    "platform",
+    "features",
+    "pricing",
+    "customers",
+    "industries",
+]
 
 TIE_PRIORITY = {
     "home": 100,
@@ -157,6 +182,31 @@ def fetch_url(url: str, deadline: float, timeout: int = 10) -> requests.Response
         return None
 
 
+def readable_url(url: str) -> str:
+    parsed = urlparse(normalize_url(url))
+    if not parsed.netloc:
+        return ""
+    return f"https://r.jina.ai/{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+
+
+def fetch_reader_page(url: str, kind: str, deadline: float) -> Page | None:
+    reader = readable_url(url)
+    if not reader:
+        return None
+    response = fetch_url(reader, deadline, timeout=10)
+    if not response or not response.text:
+        return None
+    text = clean_reader_text(response.text)
+    if len(text) < 80:
+        return None
+    title = ""
+    for line in text.splitlines()[:8]:
+        if line.lower().startswith("title:"):
+            title = line.split(":", 1)[1].strip()
+            break
+    return Page(url=url.rstrip("/"), kind=kind, html="", text=text, title=title)
+
+
 def candidate_start_urls(url: str) -> list[str]:
     normalized = normalize_url(url)
     parsed = urlparse(normalized)
@@ -179,9 +229,71 @@ def candidate_start_urls(url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def clean_reader_text(raw: str) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    junk = re.compile(r"^(javascript|skip to|sign in|log in|cookie|accept|reject)\b", re.I)
+    for line in (raw or "").splitlines():
+        line = unescape(re.sub(r"\s+", " ", line)).strip()
+        if len(line) < 3 or junk.match(line):
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+    return "\n".join(lines[:800])
+
+
+def metadata_text(soup: BeautifulSoup) -> list[str]:
+    values: list[str] = []
+    selectors = [
+        "meta[name='description']",
+        "meta[property='og:description']",
+        "meta[name='twitter:description']",
+        "meta[property='og:title']",
+        "meta[name='twitter:title']",
+        "meta[property='og:site_name']",
+        "meta[name='application-name']",
+    ]
+    for selector in selectors:
+        tag = soup.select_one(selector)
+        if tag and tag.get("content"):
+            values.append(str(tag["content"]).strip())
+    for script in soup.find_all("script", type=re.compile("ld\\+json", re.I)):
+        raw = script.string or script.get_text(" ", strip=True)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        values.extend(jsonld_strings(parsed))
+    return [value for value in values if value]
+
+
+def jsonld_strings(value: Any) -> list[str]:
+    strings: list[str] = []
+    if isinstance(value, dict):
+        for key in ["name", "alternateName", "description", "slogan", "address", "telephone", "email"]:
+            item = value.get(key)
+            if isinstance(item, str):
+                strings.append(item)
+            elif isinstance(item, dict):
+                strings.extend(jsonld_strings(item))
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                strings.extend(jsonld_strings(item))
+    elif isinstance(value, list):
+        for item in value:
+            strings.extend(jsonld_strings(item))
+    return strings
+
+
 def clean_text(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html or "", "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    meta_lines = metadata_text(soup)
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         tag.decompose()
     for selector in ["nav", "footer", "header", "[role='navigation']", ".cookie", "#cookie"]:
@@ -191,7 +303,7 @@ def clean_text(html: str) -> tuple[str, str]:
     seen: set[str] = set()
     lines: list[str] = []
     junk = re.compile(r"^(accept|reject|privacy policy|terms|cookie|subscribe|sign in|log in)$", re.I)
-    for line in raw_lines:
+    for line in [*meta_lines, *raw_lines]:
         line = unescape(re.sub(r"\s+", " ", line)).strip()
         if len(line) < 3 or junk.match(line):
             continue
@@ -255,6 +367,9 @@ def discover_from_home(home_url: str, home_html: str) -> list[str]:
         parsed = urlparse(absolute)
         if parsed.netloc == parsed_home.netloc:
             urls.append(absolute)
+    base = f"{parsed_home.scheme}://{parsed_home.netloc}"
+    for path in FALLBACK_PATHS:
+        urls.append(urljoin(base + "/", path))
     return list(dict.fromkeys(urls))[:120]
 
 
@@ -299,9 +414,15 @@ def scrape_site(url: str, deadline: float) -> tuple[list[Page], str]:
             normalized = candidate
             break
     if not response:
-        return [], normalized
+        reader_page = fetch_reader_page(normalized, "home", deadline)
+        return ([reader_page] if reader_page else []), normalized
     final_url = response.url.rstrip("/")
     home_text, home_title = clean_text(response.text)
+    if len(home_text) < 120:
+        reader_page = fetch_reader_page(final_url, "home", deadline)
+        if reader_page:
+            home_text = "\n".join([home_text, reader_page.text]).strip()
+            home_title = home_title or reader_page.title
     pages = [Page(url=final_url, kind="home", html=response.text, text=home_text, title=home_title)]
     for page_url, kind in choose_relevant_urls(final_url, response.text, deadline):
         if page_url.rstrip("/") == final_url.rstrip("/"):
@@ -313,6 +434,11 @@ def scrape_site(url: str, deadline: float) -> tuple[list[Page], str]:
         if not page_response or "text/html" not in page_response.headers.get("content-type", "text/html"):
             continue
         text, title = clean_text(page_response.text)
+        if len(text) < 120:
+            reader_page = fetch_reader_page(page_response.url.rstrip("/"), kind, deadline)
+            if reader_page:
+                text = "\n".join([text, reader_page.text]).strip()
+                title = title or reader_page.title
         if len(text) < 80:
             continue
         pages.append(Page(url=page_response.url.rstrip("/"), kind=kind, html=page_response.text, text=text, title=title))
@@ -523,6 +649,71 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
 
     categories = [
         {
+            "label": "design portfolio and creative marketplace",
+            "priority": 95,
+            "min_matches": 1,
+            "patterns": [
+                r"\bdribbble\b",
+                r"\bbehance\b",
+                r"\bportfolio\b",
+                r"\bdesigner(?:s)?\b",
+                r"\bdesign inspiration\b",
+                r"\bcreative work\b",
+                r"\bshots\b",
+                r"\billustration\b",
+                r"\bui design\b",
+                r"\bux design\b",
+                r"\bbranding\b",
+            ],
+            "service": "Design portfolio, creative inspiration, and designer discovery marketplace.",
+            "customer": "Designers, creative teams, agencies, startups, and businesses looking for visual talent or design inspiration.",
+            "pain": "Finding credible designers, comparing creative styles, and turning visual discovery into hiring or collaboration decisions.",
+            "opener_focus": "designer portfolios and creative discovery",
+            "opener_tail": "helping creative teams and buyers find the right design talent faster",
+        },
+        {
+            "label": "marketplace",
+            "priority": 75,
+            "min_matches": 2,
+            "patterns": [
+                r"\bmarketplace\b",
+                r"\bbuyers?\b",
+                r"\bsellers?\b",
+                r"\bcreators?\b",
+                r"\bfreelancers?\b",
+                r"\bhire\b",
+                r"\bjobs?\b",
+                r"\btalent\b",
+                r"\bcommunity\b",
+            ],
+            "service": "Online marketplace or community platform connecting buyers, sellers, creators, or talent.",
+            "customer": "People or businesses comparing providers, talent, listings, or community-driven services.",
+            "pain": "Reducing discovery friction, trust gaps, and decision time when choosing the right provider or opportunity.",
+            "opener_focus": "marketplace discovery and trust signals",
+            "opener_tail": "improving how users find relevant matches and take action",
+        },
+        {
+            "label": "ecommerce",
+            "priority": 65,
+            "min_matches": 2,
+            "patterns": [
+                r"\becommerce\b",
+                r"\be-commerce\b",
+                r"\bshop\b",
+                r"\bstore\b",
+                r"\bcart\b",
+                r"\bcheckout\b",
+                r"\bshipping\b",
+                r"\breturns?\b",
+                r"\bproducts?\b",
+            ],
+            "service": "Online retail, product sales, or ecommerce services.",
+            "customer": "Consumers or business buyers comparing products, pricing, delivery, and support.",
+            "pain": "Helping visitors trust product quality, find the right item quickly, and complete purchases without friction.",
+            "opener_focus": "product discovery and checkout experience",
+            "opener_tail": "turning high-intent visitors into confident buyers",
+        },
+        {
             "label": "education",
             "priority": 90,
             "min_matches": 2,
@@ -593,6 +784,27 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
             "opener_tail": "reaching teams actively looking for this support",
         },
         {
+            "label": "marketing and creative services",
+            "priority": 58,
+            "min_matches": 2,
+            "patterns": [
+                r"\bmarketing\b",
+                r"\bagency\b",
+                r"\bbranding\b",
+                r"\bcreative\b",
+                r"\bcampaign\b",
+                r"\bseo\b",
+                r"\bcontent\b",
+                r"\badvertising\b",
+                r"\bsocial media\b",
+            ],
+            "service": "Marketing, branding, creative, advertising, or content services.",
+            "customer": "Businesses trying to improve brand visibility, campaign performance, and lead generation.",
+            "pain": "Standing out in crowded channels while proving creative work drives measurable business outcomes.",
+            "opener_focus": "marketing and creative services",
+            "opener_tail": "attracting prospects who are already comparing agencies or campaign partners",
+        },
+        {
             "label": "ai and data",
             "priority": 55,
             "min_matches": 2,
@@ -651,6 +863,16 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
     )
 
     if match_count < int(best.get("min_matches", 1)):
+        if company_name.strip():
+            return {
+                "core_service": f"Public website and online presence for {company_name}.",
+                "target_customer": "Visitors, prospects, customers, or partners researching the organization online.",
+                "probable_pain_point": "Quickly understanding what the organization offers and whether it is relevant before reaching out.",
+                "outreach_opener": (
+                    f"Hi {company_name} team, I reviewed your website and saw an opportunity to make the first-touch "
+                    "company research and outreach journey clearer for high-intent visitors."
+                ),
+            }
         return {
             "core_service": "",
             "target_customer": "",
@@ -755,14 +977,28 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
     try:
         pages, final_url = scrape_site(normalized, deadline)
         if not pages:
-            fallback_name = website_name.strip() or name_from_domain(final_url or normalized)
-            fallback_text = f"{normalized}\n{final_url}\n{fallback_name}"
-            profile["website_name"] = fallback_name
-            profile["company_name"] = fallback_name
-            profile.update(local_business_insights(fallback_text, fallback_name))
+            domain_name = name_from_domain(final_url or normalized)
+            fallback_text = f"{normalized}\n{final_url}\n{website_name}\n{domain_name}"
+            facts = {
+                "website_name": website_name.strip() or domain_name,
+                "company_name": domain_name,
+                "address": "",
+                "mobile_number": "",
+                "mail": [],
+                "source_url": final_url or normalized,
+            }
+            profile.update(facts)
+            for key, value in local_business_insights(fallback_text, domain_name).items():
+                if value and not profile.get(key):
+                    profile[key] = value
+            profile["website_name"] = website_name.strip() or profile.get("website_name") or domain_name
+            profile["company_name"] = profile.get("company_name") or domain_name
+            profile["mail"] = []
+            profile["mobile_number"] = ""
+            profile["address"] = ""
             return stable_profile(profile)
 
-        all_text = "\n".join(page.text for page in pages)
+        all_text = "\n".join([final_url, website_name, *[page.text for page in pages]])
         contact_text = "\n".join(page.text for page in pages if page.kind == "contact") or all_text
         phones = extract_phones(contact_text)
         address = extract_address(contact_text)
