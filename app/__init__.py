@@ -1,0 +1,1 @@
+"""Company enrichment web app."""

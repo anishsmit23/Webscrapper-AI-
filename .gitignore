@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+env/
+.env
+.env.local
+plan.txt
+data/companies.db
+results.json
+*.log
+*.out.log
+*.err.log
+.ipynb_checkpoints/
+*.sqlite3
+*.db
+Thumbs.db
+.DS_Store

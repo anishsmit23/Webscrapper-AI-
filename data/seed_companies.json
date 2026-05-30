@@ -1,0 +1,35 @@
+[
+  {
+    "website_name": "Stripe",
+    "company_name": "Stripe",
+    "address": "",
+    "mobile_number": "",
+    "mail": [],
+    "core_service": "Online payment processing and financial infrastructure for internet businesses.",
+    "target_customer": "SaaS companies, marketplaces, e-commerce brands, startups, and enterprises that need payments or embedded finance.",
+    "probable_pain_point": "Managing secure payments, billing, fraud prevention, and global payment methods while scaling across markets.",
+    "outreach_opener": "Hi Stripe team, I noticed your platform supports businesses that need reliable payments and financial infrastructure. I would love to share a quick idea around improving enrichment for high-intent merchant leads."
+  },
+  {
+    "website_name": "Zapier",
+    "company_name": "Zapier",
+    "address": "",
+    "mobile_number": "",
+    "mail": [],
+    "core_service": "Workflow automation connecting apps and automating business processes.",
+    "target_customer": "Operations, marketing, sales, support, and product teams that rely on many SaaS tools.",
+    "probable_pain_point": "Reducing repetitive manual work and keeping customer or operational data synchronized across tools.",
+    "outreach_opener": "Hi Zapier team, I saw your focus on helping teams automate work across their apps. I would love to share a quick idea for identifying automation-ready accounts from website signals."
+  },
+  {
+    "website_name": "Notion",
+    "company_name": "Notion",
+    "address": "",
+    "mobile_number": "",
+    "mail": [],
+    "core_service": "Connected workspace for notes, documents, projects, knowledge bases, and team collaboration.",
+    "target_customer": "Startups, product teams, knowledge workers, students, and companies that want a flexible collaborative workspace.",
+    "probable_pain_point": "Keeping knowledge, project work, and documentation organized as teams grow.",
+    "outreach_opener": "Hi Notion team, I noticed your product helps teams centralize knowledge and workflows. I would love to share how website intelligence can surface teams that are actively restructuring their operations."
+  }
+]
