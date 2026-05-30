@@ -97,13 +97,40 @@ def normalize_url(url: str) -> str:
     return parsed.geturl().rstrip("/")
 
 
+def prettify_company_name(name: str) -> str:
+    raw = re.sub(r"[-_]+", " ", name or "").strip()
+    compact = re.sub(r"[^A-Za-z0-9]+", "", raw).lower()
+    known_suffixes = [
+        "packers",
+        "movers",
+        "logistics",
+        "transport",
+        "technologies",
+        "technology",
+        "solutions",
+        "services",
+        "systems",
+        "software",
+        "finance",
+        "healthcare",
+    ]
+    for suffix in known_suffixes:
+        if compact.endswith(suffix) and len(compact) > len(suffix) + 2:
+            prefix = compact[: -len(suffix)]
+            if prefix == "omsai":
+                prefix = "om sai"
+            raw = f"{prefix} {suffix}"
+            break
+    return re.sub(r"\s+", " ", raw).title()
+
+
 def name_from_domain(url: str) -> str:
     parsed = urlparse(normalize_url(url))
     host = parsed.netloc.replace("www.", "")
     if not host:
         return ""
     stem = host.split(".")[0]
-    return re.sub(r"[-_]+", " ", stem).title()
+    return prettify_company_name(stem)
 
 
 def humanize_name(name: str) -> str:
@@ -416,7 +443,7 @@ def infer_names(pages: list[Page], final_url: str) -> tuple[str, str]:
         re.I,
     )
     for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
-        candidate = re.sub(r"\s+", " ", candidate).strip()
+        candidate = prettify_company_name(re.sub(r"\s+", " ", candidate).strip())
         if 2 < len(candidate) <= 40 and not marketing_words.search(candidate):
             return candidate, candidate
     return domain_name, domain_name
@@ -433,10 +460,14 @@ def compact_context(pages: list[Page], max_chars: int = 14000) -> str:
 
 def local_business_insights(text: str, company_name: str) -> dict[str, str]:
     lowered = f"{company_name}\n{text}".lower()
+
+    def has_pattern(pattern: str) -> bool:
+        return bool(re.search(pattern, lowered, re.I))
+
     def visible_terms(patterns: list[tuple[str, str]], limit: int = 5) -> list[str]:
         found: list[str] = []
         for pattern, label in patterns:
-            if re.search(pattern, text, re.I) and label not in found:
+            if has_pattern(pattern) and label not in found:
                 found.append(label)
         return found[:limit]
 
@@ -448,12 +479,6 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
                 (r"\bmba\b", "MBA"),
                 (r"\bmca\b", "MCA"),
                 (r"\bph\.?\s*d\b", "Ph.D."),
-                (r"\bengineering\b", "engineering"),
-                (r"\bcomputer science\b", "computer science"),
-                (r"\bdata science\b", "data science"),
-                (r"\bartificial intelligence\b|\bai\b", "AI"),
-                (r"\bmanagement\b", "management"),
-                (r"\ballied health\b|\bmedical\b|\bnursing\b", "health sciences"),
             ]
         )
         locations = visible_terms(
@@ -472,7 +497,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         customer = "Prospective students"
         if locations:
             customer += f" from {', '.join(locations[:2])}"
-        customer += " evaluating technical, professional, and career-oriented programs"
+        customer += " evaluating academic and career-oriented programs"
         if programs:
             customer += f" such as {', '.join(programs[:3])}"
         customer += "."
@@ -500,6 +525,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         {
             "label": "education",
             "priority": 90,
+            "min_matches": 2,
             "patterns": [
                 r"\buniversity\b",
                 r"\binstitute\b",
@@ -507,16 +533,13 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
                 r"\bschool\b",
                 r"\bcampus\b",
                 r"\badmission(?:s)?\b",
-                r"\bprogramme?s?\b",
-                r"\bcourses?\b",
                 r"\bdegree\b",
                 r"\bfaculty\b",
-                r"\bstudents?\b",
-                r"\bplacements?\b",
-                r"\bengineering\b",
-                r"\bmanagement\b",
+                r"\beducation\b",
                 r"\bb\.?\s*tech\b",
                 r"\bm\.?\s*tech\b",
+                r"\bmba\b",
+                r"\bmca\b",
                 r"\bph\.?\s*d\b",
             ],
             **education_specifics(),
@@ -526,14 +549,15 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         {
             "label": "packing, moving, relocation, and logistics",
             "priority": 80,
+            "min_matches": 2,
             "patterns": [
                 r"\bpackers?\b",
                 r"\bmovers?\b",
+                r"packers",
+                r"movers",
                 r"\bpacking\b",
                 r"\bshifting\b",
                 r"\brelocation\b",
-                r"\btransport(?:ation)?\b",
-                r"\blogistics\b",
                 r"\bfreight\b",
                 r"\bwarehouse\b",
                 r"\bloading\b",
@@ -550,6 +574,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         {
             "label": "software and cloud technology",
             "priority": 40,
+            "min_matches": 1,
             "patterns": [
                 r"\bsoftware\b",
                 r"\bsaas\b",
@@ -558,6 +583,8 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
                 r"\bplatform\b",
                 r"\bapp(?:lication)?s?\b",
                 r"\bdevops\b",
+                r"\bdata engineering\b",
+                r"\bdata infrastructure\b",
             ],
             "service": "Software, cloud, or platform-based technology services.",
             "customer": "Businesses looking to modernize software workflows or digital operations.",
@@ -567,10 +594,13 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         },
         {
             "label": "ai and data",
-            "priority": 30,
+            "priority": 55,
+            "min_matches": 2,
             "patterns": [
                 r"\bartificial intelligence\b",
                 r"\bgenerative ai\b",
+                r"\btraditional ai\b",
+                r"\bdata engineering\b",
                 r"\bmachine learning\b",
                 r"\bdata annotation\b",
                 r"\bdata analytics\b",
@@ -587,6 +617,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         {
             "label": "healthcare",
             "priority": 70,
+            "min_matches": 2,
             "patterns": [r"\bhealthcare\b", r"\bhospital\b", r"\bclinic\b", r"\bpatient\b", r"\bmedical\b"],
             "service": "Healthcare or medical services.",
             "customer": "Patients, healthcare providers, or organizations needing medical support.",
@@ -597,6 +628,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         {
             "label": "finance",
             "priority": 60,
+            "min_matches": 2,
             "patterns": [r"\bfinance\b", r"\bfinancial\b", r"\bloan\b", r"\binsurance\b", r"\bpayment\b", r"\btax\b"],
             "service": "Financial, insurance, payment, or advisory services.",
             "customer": "Individuals or businesses managing financial decisions and transactions.",
@@ -608,7 +640,7 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
 
     match_counts = [
         (
-            sum(1 for pattern in category["patterns"] if re.search(pattern, lowered)),
+            sum(1 for pattern in category["patterns"] if has_pattern(pattern)),
             category,
         )
         for category in categories
@@ -617,6 +649,14 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         match_counts,
         key=lambda item: (item[0] * 10 + int(item[1]["priority"]), item[0]),
     )
+
+    if match_count < int(best.get("min_matches", 1)):
+        return {
+            "core_service": "",
+            "target_customer": "",
+            "probable_pain_point": "",
+            "outreach_opener": "",
+        }
 
     service = customer = pain = opener = ""
     if match_count:
@@ -715,6 +755,11 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
     try:
         pages, final_url = scrape_site(normalized, deadline)
         if not pages:
+            fallback_name = website_name.strip() or name_from_domain(final_url or normalized)
+            fallback_text = f"{normalized}\n{final_url}\n{fallback_name}"
+            profile["website_name"] = fallback_name
+            profile["company_name"] = fallback_name
+            profile.update(local_business_insights(fallback_text, fallback_name))
             return stable_profile(profile)
 
         all_text = "\n".join(page.text for page in pages)
@@ -740,7 +785,7 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
         fallback_insights = local_business_insights(all_text, display_company_name)
         merged = {**profile, **ai_data}
         for key, value in fallback_insights.items():
-            if value:
+            if value and not merged.get(key):
                 merged[key] = value
 
         # Deterministic contact extraction wins over model output.
