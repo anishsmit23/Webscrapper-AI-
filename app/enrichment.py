@@ -355,6 +355,14 @@ def clean_text(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html or "", "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     meta_lines = metadata_text(soup)
+    
+    # Extract explicit contact links before stripping
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip().lower()
+        if href.startswith("mailto:"):
+            meta_lines.append(f"Email Link: {href.replace('mailto:', '').split('?')[0]}")
+        elif href.startswith("tel:"):
+            meta_lines.append(f"Phone Link: {href.replace('tel:', '')}")
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         tag.decompose()
     for selector in ["nav", "footer", "header", "[role='navigation']", ".cookie", "#cookie"]:
@@ -993,23 +1001,20 @@ def call_gemini(context: str, facts: dict[str, Any], deadline: float) -> dict[st
         return {}
     model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
     prompt = f"""
-You enrich company website research. Return ONLY a valid JSON object with exactly these keys:
-website_name, company_name, address, mobile_number, mail, core_service, target_customer, probable_pain_point, outreach_opener.
+You enrich company website research. Return ONLY a valid JSON object with EXACTLY these keys:
+thought_process, website_name, company_name, address, mobile_number, mail, core_service, target_customer, probable_pain_point, outreach_opener.
 
 Hard rules:
-- Do not invent email, phone, or address. Use the factual extraction below for those fields.
-- If a factual field is absent, use "" or [].
-- Business insight fields may be inferred only from the supplied website text.
+- thought_process: Use this field first to reason step-by-step about the company's true business model, target audience scale (local vs national/global), and to find the most accurate contact details.
+- Contact Details (mail, mobile_number, address): Use the 'Factual extraction' below as a strong baseline. However, if the factual extraction is missing data, or clearly captured a random sentence instead of an address, you MUST extract the correct details directly from the provided 'Cleaned website text'. Do not invent or hallucinate; only extract what is visibly present.
+- If a contact field is truly absent, use "" or []. mail must be an array of strings.
 - First identify the organization type: education, logistics, healthcare, finance, software, AI/data, etc.
 - If the site is a college, university, institute, school, admissions page, or campus page, classify it as education even if it mentions AI, data science, engineering, or software courses.
 - Do not classify a business as AI/data just because AI appears as a course, department, blog topic, client use case, or incidental phrase.
 - core_service: Name actual programs, departments, services, specializations, industries, or products visible on the site. Never write generic industry descriptions.
-- target_customer: Be specific about geography, entry path, audience segment, buyer type, or use case based on visible content.
+- target_customer: Identify the TRUE target customer. Do NOT artificially restrict the geography to the organization's physical address unless they are a strictly local business (e.g., a local plumber or restaurant). For universities, software companies, logistics, and digital services, the audience is usually national or global. Be specific about the buyer/user profile based on visible content.
 - probable_pain_point: Must be specific to this organization's niche, geography, positioning, or offering. Generic statements like "choosing the right program" are not acceptable.
-- outreach_opener: Must reference one concrete detail from the website such as a program, location, placement/admissions theme, service, product, industry, or stated goal.
-- outreach_opener: Do not use vague phrases like "I would love to share an idea"; offer a concrete relevant value.
-- Outreach opener must be concise, specific, and must not include fake metrics or unsupported claims.
-- mail must be an array of strings.
+- outreach_opener: Must reference one concrete detail from the website such as a program, location, placement/admissions theme, service, product, industry, or stated goal. Do not use vague phrases like "I would love to share an idea"; offer a concrete relevant value. Must be concise, specific, and must not include fake metrics or unsupported claims.
 
 Factual extraction:
 {json.dumps(facts, ensure_ascii=False)}
