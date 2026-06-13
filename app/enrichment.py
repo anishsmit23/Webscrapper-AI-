@@ -355,14 +355,19 @@ def clean_text(html: str) -> tuple[str, str]:
     soup = BeautifulSoup(html or "", "html.parser")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     meta_lines = metadata_text(soup)
-    
-    # Extract explicit contact links before stripping
+    hidden_contacts: list[str] = []
+
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip().lower()
-        if href.startswith("mailto:"):
-            meta_lines.append(f"Email Link: {href.replace('mailto:', '').split('?')[0]}")
-        elif href.startswith("tel:"):
-            meta_lines.append(f"Phone Link: {href.replace('tel:', '')}")
+        href = str(a["href"]).strip()
+        href_lower = href.lower()
+        if href_lower.startswith("mailto:"):
+            email = unescape(href.split(":", 1)[1].split("?", 1)[0]).strip()
+            if email:
+                hidden_contacts.append(f"Email Link: {email}")
+        elif href_lower.startswith("tel:"):
+            phone = unescape(href.split(":", 1)[1].split("?", 1)[0]).strip()
+            if phone:
+                hidden_contacts.append(f"Phone Link: {phone}")
     for tag in soup(["script", "style", "noscript", "svg", "canvas", "iframe"]):
         tag.decompose()
     for selector in ["nav", "footer", "header", "[role='navigation']", ".cookie", "#cookie"]:
@@ -372,6 +377,8 @@ def clean_text(html: str) -> tuple[str, str]:
     seen: set[str] = set()
     lines: list[str] = []
     junk = re.compile(r"^(accept|reject|privacy policy|terms|cookie|subscribe|sign in|log in)$", re.I)
+    if hidden_contacts:
+        meta_lines = ["Hidden Contact Links", *hidden_contacts, *meta_lines]
     for line in [*meta_lines, *raw_lines]:
         line = unescape(re.sub(r"\s+", " ", line)).strip()
         if len(line) < 3 or junk.match(line):
@@ -590,10 +597,55 @@ def extract_address(text: str) -> str:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     address_words = re.compile(
         r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|building|"
-        r"city|state|zip|postal|india|usa|united states|canada|australia)\b",
+        r"campus|mile|tadong|gangtok|sikkim|city|state|zip|postal|pin|pincode|india|usa|"
+        r"united states|canada|australia)\b",
+        re.I,
+    )
+    location_words = re.compile(
+        r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|building|"
+        r"campus|mile|near|post|po|district|dist\.|city|state|zip|postal|pin|pincode|"
+        r"india|usa|united states|canada|australia)\b",
         re.I,
     )
     phone_or_support = re.compile(r"\b(toll free|phone|fax|call|tel|mobile|email|@)\b", re.I)
+    non_address = re.compile(
+        r"\b(accreditation|assessment|ranked|ranking|universities ranked|top private|"
+        r"admissions?|programs?|courses?|placement|download|apply now|copyright)\b",
+        re.I,
+    )
+
+    def clean_candidate(value: str) -> str:
+        value = re.sub(r"^(?:address|head office|registered office|corporate office)\s*[:.-]?\s*", "", value, flags=re.I)
+        value = re.sub(r"^(?:\+?\d[\d\s().-]{7,}\d\s*)+", "", value).strip(" :-,")
+        return re.sub(r"\s+", " ", value).strip(" :-,")
+
+    def score_candidate(value: str) -> int:
+        candidate = clean_candidate(value)
+        if len(candidate) < 18 or len(candidate) > 320:
+            return 0
+        if phone_or_support.search(candidate) and len(re.findall(r"\d", candidate)) >= 7:
+            return 0
+        strong_location = bool(
+            re.search(
+                r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|"
+                r"building|campus|mile|near|post|po|district|dist\.|pin|pincode|postal)\b",
+                candidate,
+                re.I,
+            )
+            or re.search(r"\b\d{5,6}\b", candidate)
+        )
+        if non_address.search(candidate) and not strong_location:
+            return 0
+        score = 0
+        score += 35 if location_words.search(candidate) else 0
+        score += 20 if re.search(r"\b\d{5,6}\b", candidate) else 0
+        score += 15 if re.search(r"\b(india|usa|united states|canada|australia)\b", candidate, re.I) else 0
+        score += 12 if "," in candidate else 0
+        score += 10 if re.search(r"\b(address|office|campus)\b", value, re.I) else 0
+        score -= 45 if non_address.search(candidate) else 0
+        return score
+
+    candidates: list[tuple[int, str]] = []
     for idx, line in enumerate(lines):
         if re.search(r"\b(address|head office|registered office|corporate office)\b", line, re.I):
             parts: list[str] = []
@@ -605,19 +657,58 @@ def extract_address(text: str) -> str:
                     break
                 parts.append(candidate)
             address = " ".join(parts).strip(" :-,")
-            address = re.sub(r"^(?:\+?\d[\d\s().-]{7,}\d\s*)+", "", address).strip(" :-,")
-            if len(address) > 20 and re.search(r"\d", address):
-                return address[:300]
+            score = score_candidate(address)
+            if score:
+                candidates.append((score + 20, clean_candidate(address)[:300]))
         window = " ".join(lines[idx : idx + 3])
         digit_count = len(re.findall(r"\d", window))
         if phone_or_support.search(window) and digit_count >= 7:
             continue
         if len(re.findall(r"\d[\d\s().+-]{6,}\d", window)) >= 2:
             continue
-        if len(window) > 35 and address_words.search(window) and re.search(r"\d", window):
-            window = re.sub(r"^(?:\+?\d[\d\s().-]{7,}\d\s*)+", "", window).strip(" :-,")
-            return window[:250]
+        if len(window) > 35 and address_words.search(window):
+            score = score_candidate(window)
+            if score:
+                candidates.append((score, clean_candidate(window)[:250]))
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+        return candidates[0][1]
     return ""
+
+
+def valid_email_list(value: Any) -> list[str]:
+    raw_values = value if isinstance(value, list) else [value]
+    emails: list[str] = []
+    for raw in raw_values:
+        for email in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", str(raw or "")):
+            cleaned = email.strip(".,;:()[]{}").lower()
+            if cleaned and cleaned not in emails:
+                emails.append(cleaned)
+    return emails[:5]
+
+
+def valid_phone(value: Any) -> str:
+    phones = extract_phones(str(value or ""))
+    return phones[0] if phones else ""
+
+
+def looks_like_address(value: Any) -> bool:
+    address = str(value or "").strip()
+    if len(address) < 18:
+        return False
+    if re.search(r"@", address):
+        return False
+    if re.search(r"\b(accreditation|assessment|ranked|ranking|top private|download|apply now)\b", address, re.I):
+        return False
+    return bool(
+        re.search(
+            r"\b(street|st\.|road|rd\.|avenue|ave\.|lane|building|campus|mile|tadong|gangtok|"
+            r"sikkim|pin|pincode|postal|india|usa|united states|canada|australia)\b",
+            address,
+            re.I,
+        )
+        or re.search(r"\b\d{5,6}\b", address)
+    )
 
 
 def infer_names(pages: list[Page], final_url: str) -> tuple[str, str]:
@@ -1112,10 +1203,18 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
             if value and not merged.get(key):
                 merged[key] = value
 
-        # Deterministic contact extraction wins over model output.
-        merged["mail"] = emails
-        merged["mobile_number"] = phones[0] if phones else ""
-        merged["address"] = address
+        ai_emails = valid_email_list(ai_data.get("mail"))
+        ai_phone = valid_phone(ai_data.get("mobile_number"))
+        ai_address = str(ai_data.get("address") or "").strip()
+
+        merged["mail"] = emails or ai_emails
+        merged["mobile_number"] = phones[0] if phones else ai_phone
+        if looks_like_address(address):
+            merged["address"] = address
+        elif looks_like_address(ai_address):
+            merged["address"] = ai_address[:300]
+        else:
+            merged["address"] = ""
         merged["website_name"] = website_name.strip() or merged.get("website_name") or inferred_website_name
         merged["company_name"] = merged.get("company_name") or display_company_name
         return stable_profile(merged)
