@@ -71,6 +71,22 @@ def test_extract_address_rejects_program_label_mixed_with_phone() -> None:
     )
 
 
+def test_extract_address_rejects_testimonial_prose_with_country() -> None:
+    text = """
+    Received when I was a student at SMU.
+    Also, the advanced subjects taught in SMU really makes you stand out amongst the many lot of students in this field.
+    When I moved to Canada
+    """
+
+    bad_address = (
+        "Received when I was a student at SMU. Also, the advanced subjects taught in SMU really makes you "
+        "stand out amongst the many lot of students in this field. When I moved to Canada"
+    )
+
+    assert extract_address(text) == ""
+    assert not looks_like_address(bad_address)
+
+
 def test_infer_names_uses_known_section_path_for_smit() -> None:
     pages = [
         Page(
@@ -115,6 +131,7 @@ def test_education_fallback_does_not_localize_students_to_campus() -> None:
 
     insights = local_business_insights(text, "Sikkim Manipal Institute Of Technology")
 
+    assert "at India" not in insights["core_service"]
     assert "across India" in insights["target_customer"]
     assert "from Sikkim" not in insights["target_customer"]
 

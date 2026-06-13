@@ -625,6 +625,11 @@ def extract_address(text: str) -> str:
         r"humanities|liberal arts)\b",
         re.I,
     )
+    prose_or_testimonial = re.compile(
+        r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
+        r"testimonial|alumni|experience|career|subjects?)\b",
+        re.I,
+    )
 
     def clean_candidate(value: str) -> str:
         value = re.sub(r"^(?:address|head office|registered office|corporate office)\s*[:.-]?\s*", "", value, flags=re.I)
@@ -639,6 +644,9 @@ def extract_address(text: str) -> str:
             return 0
         if phone_or_support.search(candidate) and len(re.findall(r"\d", candidate)) >= 7:
             return 0
+        word_count = len(re.findall(r"[A-Za-z]+", candidate))
+        if prose_or_testimonial.search(candidate) and word_count > 10:
+            return 0
         strong_location = bool(
             re.search(
                 r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|"
@@ -648,6 +656,13 @@ def extract_address(text: str) -> str:
             )
             or re.search(r"\b\d{5,6}\b", candidate)
         )
+        country_with_structure = bool(
+            "," in candidate
+            and re.search(r"\b(india|usa|united states|canada|australia)\b", candidate, re.I)
+            and word_count <= 18
+        )
+        if not strong_location and not country_with_structure:
+            return 0
         if non_address.search(candidate) and not strong_location:
             return 0
         if re.search(r"\([^)]{35,}\)", candidate) and non_address.search(candidate):
@@ -724,15 +739,29 @@ def looks_like_address(value: Any) -> bool:
         return False
     if re.search(r"\+?\d[\d\s().-]{7,}\d", address):
         return False
-    return bool(
+    word_count = len(re.findall(r"[A-Za-z]+", address))
+    if re.search(
+        r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
+        r"testimonial|alumni|experience|career|subjects?)\b",
+        address,
+        re.I,
+    ) and word_count > 10:
+        return False
+    strong_location = bool(
         re.search(
             r"\b(street|st\.|road|rd\.|avenue|ave\.|lane|building|campus|mile|"
-            r"pin|pincode|postal|india|usa|united states|canada|australia)\b",
+            r"pin|pincode|postal)\b",
             address,
             re.I,
         )
         or re.search(r"\b\d{5,6}\b", address)
     )
+    country_with_structure = bool(
+        "," in address
+        and re.search(r"\b(india|usa|united states|canada|australia)\b", address, re.I)
+        and word_count <= 18
+    )
+    return strong_location or country_with_structure
 
 
 def acronym_for_name(name: str) -> str:
@@ -842,8 +871,12 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
             limit=3,
         )
         service_focus = ", ".join(programs[:4]) if programs else "academic programs"
-        location_focus = f" at {', '.join(locations[:2])}" if locations else ""
-        service = f"Undergraduate and postgraduate education in {service_focus}{location_focus}."
+        regional_locations = [location for location in locations if location.lower() != "india"]
+        location_focus = f" at {', '.join(regional_locations[:2])}" if regional_locations else ""
+        if programs:
+            service = f"Undergraduate and postgraduate programs such as {service_focus}{location_focus}."
+        else:
+            service = f"Undergraduate and postgraduate education through academic programs{location_focus}."
         customer = "Prospective undergraduate and postgraduate students across India"
         if has_pattern(r"\binternational\b|\bnri\b|\bforeign students?\b"):
             customer += " and internationally"
