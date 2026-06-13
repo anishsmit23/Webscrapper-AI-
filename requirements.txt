@@ -2,6 +2,8 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 requests==2.32.3
 beautifulsoup4==4.12.3
-google-generativeai==0.8.3
+google-genai>=1.0.0
 pydantic==2.9.2
 python-dotenv==1.0.1
+certifi>=2024.2.2
+slowapi>=0.1.9

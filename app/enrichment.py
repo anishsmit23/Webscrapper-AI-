@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import ipaddress
 import re
+import socket
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -17,12 +20,15 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 except Exception:  # pragma: no cover - dependency may be absent in local smoke tests
     genai = None
+    genai_types = None
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 SCHEMA_KEYS = [
     "website_name",
@@ -84,6 +90,18 @@ TIE_PRIORITY = {
     "other": 10,
 }
 
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+]
+
 
 @dataclass
 class Page:
@@ -120,6 +138,31 @@ def normalize_url(url: str) -> str:
         url = "https://" + url
     parsed = urlparse(url)
     return parsed.geturl().rstrip("/")
+
+
+def is_safe_url(url: str) -> bool:
+    parsed = urlparse(normalize_url(url))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address[4][0])
+        except ValueError:
+            return False
+        if any(ip in network for network in BLOCKED_NETWORKS):
+            return False
+    return True
+
+
+def validate_public_url(url: str) -> str:
+    normalized = normalize_url(url)
+    if not is_safe_url(normalized):
+        raise ValueError("URL must be a public http(s) website")
+    return normalized
 
 
 def prettify_company_name(name: str) -> str:
@@ -166,19 +209,37 @@ def humanize_name(name: str) -> str:
 def fetch_url(url: str, deadline: float, timeout: int = 10) -> requests.Response | None:
     if time.monotonic() >= deadline:
         return None
+    if not is_safe_url(url):
+        logger.warning("Blocked unsafe fetch target: %s", url)
+        return None
     try:
-        remaining = max(1.0, min(timeout, deadline - time.monotonic()))
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=remaining,
-            allow_redirects=True,
-            verify=certifi.where(),
-        )
+        current_url = url
+        response = None
+        for _ in range(5):
+            remaining = max(1.0, min(timeout, deadline - time.monotonic()))
+            response = requests.get(
+                current_url,
+                headers=HEADERS,
+                timeout=remaining,
+                allow_redirects=False,
+                verify=certifi.where(),
+            )
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("location", "")
+                next_url = urljoin(current_url, location)
+                if not is_safe_url(next_url):
+                    logger.warning("Blocked unsafe redirect from %s to %s", current_url, next_url)
+                    return None
+                current_url = next_url
+                continue
+            break
+        if response is None:
+            return None
         if response.status_code >= 400:
             return None
         return response
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        logger.info("Fetch failed for %s: %s", url, exc)
         return None
 
 
@@ -497,12 +558,22 @@ def extract_emails(text: str, final_url: str = "", company_name: str = "") -> li
     return cleaned[:5]
 
 
+def _normalize_phone_digits(raw: str) -> str:
+    """Strip to pure digits for dedup (collapse +91-9876 and 09876...)."""
+    digits = re.sub(r"\D", "", raw)
+    # Remove leading country-code zeroes for comparison
+    return digits.lstrip("0") or digits
+
+
 def extract_phones(text: str) -> list[str]:
     pattern = re.compile(r"(?:(?:\+|00)\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?){2,5}\d{3,4}")
     phones: list[str] = []
+    seen_digits: set[str] = set()
     for raw in pattern.findall(text or ""):
         digits = re.sub(r"\D", "", raw)
-        if 8 <= len(digits) <= 15 and raw.strip() not in phones:
+        normalized = _normalize_phone_digits(raw)
+        if 8 <= len(digits) <= 15 and normalized not in seen_digits:
+            seen_digits.add(normalized)
             phones.append(raw.strip())
     return phones[:3]
 
@@ -920,8 +991,7 @@ def call_gemini(context: str, facts: dict[str, Any], deadline: float) -> dict[st
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or genai is None or time.monotonic() >= deadline:
         return {}
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
     prompt = f"""
 You enrich company website research. Return ONLY a valid JSON object with exactly these keys:
 website_name, company_name, address, mobile_number, mail, core_service, target_customer, probable_pain_point, outreach_opener.
@@ -948,19 +1018,32 @@ Cleaned website text:
 {context}
 """
     try:
-        remaining = max(2, min(8, int(deadline - time.monotonic())))
-        response = model.generate_content(
-            prompt,
-            generation_config={"temperature": 0.2, "response_mime_type": "application/json"},
-            request_options={"timeout": remaining},
+        remaining = min(8, int(deadline - time.monotonic()))
+        if remaining <= 0:
+            return {}
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+            ),
         )
         return parse_json_object(getattr(response, "text", ""))
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning("Gemini response parsing error: %s", exc)
+        return {}
     except Exception:
+        logger.exception("Gemini enrichment call failed")
         return {}
 
 
 def stable_profile(data: dict[str, Any]) -> dict[str, Any]:
     profile = {key: data.get(key, [] if key == "mail" else "") for key in SCHEMA_KEYS}
+    source_url = str(data.get("source_url") or data.get("url") or "").strip()
+    if source_url:
+        profile["source_url"] = source_url
     if not isinstance(profile["mail"], list):
         profile["mail"] = [str(profile["mail"])] if profile["mail"] else []
     profile["mail"] = [str(email).strip() for email in profile["mail"] if str(email).strip()]
@@ -972,7 +1055,7 @@ def stable_profile(data: dict[str, Any]) -> dict[str, Any]:
 
 def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) -> dict[str, Any]:
     deadline = time.monotonic() + total_timeout
-    normalized = normalize_url(url)
+    normalized = validate_public_url(url)
     profile = empty_profile(normalized, website_name)
     try:
         pages, final_url = scrape_site(normalized, deadline)
@@ -1031,5 +1114,12 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
         merged["website_name"] = website_name.strip() or merged.get("website_name") or inferred_website_name
         merged["company_name"] = merged.get("company_name") or display_company_name
         return stable_profile(merged)
+    except ValueError as exc:
+        logger.warning("URL validation or parsing error for %s: %s", url, exc)
+        return stable_profile(profile)
+    except requests.RequestException as exc:
+        logger.warning("Network error enriching %s: %s", url, exc)
+        return stable_profile(profile)
     except Exception:
+        logger.exception("Unexpected error enriching URL: %s", url)
         return stable_profile(profile)
