@@ -627,7 +627,8 @@ def extract_address(text: str) -> str:
     )
     prose_or_testimonial = re.compile(
         r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
-        r"testimonial|alumni|experience|career|subjects?)\b",
+        r"testimonial|alumni|experience|career|subjects?|reputed colleges?|quality education|"
+        r"safe campus|equal chance|placed in industries|everybody gets|placed|industries)\b",
         re.I,
     )
 
@@ -742,7 +743,8 @@ def looks_like_address(value: Any) -> bool:
     word_count = len(re.findall(r"[A-Za-z]+", address))
     if re.search(
         r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
-        r"testimonial|alumni|experience|career|subjects?)\b",
+        r"testimonial|alumni|experience|career|subjects?|reputed colleges?|quality education|"
+        r"safe campus|equal chance|placed in industries|everybody gets|placed|industries)\b",
         address,
         re.I,
     ) and word_count > 10:

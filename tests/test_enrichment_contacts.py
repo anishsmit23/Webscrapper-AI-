@@ -87,6 +87,26 @@ def test_extract_address_rejects_testimonial_prose_with_country() -> None:
     assert not looks_like_address(bad_address)
 
 
+def test_extract_address_rejects_review_prose_with_campus_and_india() -> None:
+    text = """
+    MR TRINETRA BHUSHAN
+    SMIT is one of the reputed colleges in India.
+    It is safe campus.
+    Quality education is provided here.
+    Everybody gets equal chance to be placed in industries.
+    Anmolika Yashashwini
+    """
+
+    bad_address = (
+        "MR TRINETRA BHUSHAN SMIT is one of the reputed colleges in India. It is safe campus. "
+        "Quality education is provided here. Everybody gets equal chance to be placed in industries. "
+        "Anmolika Yashashwini"
+    )
+
+    assert extract_address(text) == ""
+    assert not looks_like_address(bad_address)
+
+
 def test_infer_names_uses_known_section_path_for_smit() -> None:
     pages = [
         Page(
