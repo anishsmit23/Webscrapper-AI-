@@ -2,11 +2,9 @@ from app.enrichment import (
     Page,
     clean_text,
     discover_from_home,
-    extract_address,
     extract_emails,
     infer_names,
     local_business_insights,
-    looks_like_address,
     repair_education_profile,
 )
 
@@ -27,84 +25,6 @@ def test_clean_text_preserves_mailto_and_tel_links() -> None:
     assert "Email Link: SMU.Helpdesk@smu.edu.in" in text
     assert "Phone Link: +91-9732947000" in text
     assert extract_emails(text) == ["smu.helpdesk@smu.edu.in"]
-
-
-def test_extract_address_accepts_university_address_without_pin_code() -> None:
-    text = """
-    Contact Us
-    Sikkim Manipal University
-    Address
-    5th Mile, Tadong, Gangtok, East Sikkim, Sikkim, India
-    Phone: +91 9732947000
-    Email: smu.helpdesk@smu.edu.in
-    """
-
-    address = extract_address(text)
-
-    assert address == "5th Mile, Tadong, Gangtok, East Sikkim, Sikkim, India"
-    assert looks_like_address(address)
-
-
-def test_extract_address_rejects_ranking_sentence() -> None:
-    text = """
-    National Assessment and Accreditation Council Top Private Universities Ranked in India
-    India's Top 20 Technical Universities (Pvt.)
-    Admissions open for B.Tech, MBA and MCA
-    """
-
-    assert extract_address(text) == ""
-    assert not looks_like_address(
-        "National Assessment and Accreditation Council Top Private Universities Ranked in India"
-    )
-
-
-def test_extract_address_rejects_program_label_mixed_with_phone() -> None:
-    text = """
-    Contact
-    Tadong Campus ( Medical, Nursing, Physiotherapy, Allied Health, Biotechnology,
-    Hospital Administration, Humanities Social Sciences and Liberal Arts ) +91 90836 18855
-    """
-
-    assert extract_address(text) == ""
-    assert not looks_like_address(
-        "Tadong Campus ( Medical, Nursing, Physiotherapy, Allied Health, Biotechnology, Hospital Administration, Humanities Social Sciences and Liberal Arts ) +91 90836 18855"
-    )
-
-
-def test_extract_address_rejects_testimonial_prose_with_country() -> None:
-    text = """
-    Received when I was a student at SMU.
-    Also, the advanced subjects taught in SMU really makes you stand out amongst the many lot of students in this field.
-    When I moved to Canada
-    """
-
-    bad_address = (
-        "Received when I was a student at SMU. Also, the advanced subjects taught in SMU really makes you "
-        "stand out amongst the many lot of students in this field. When I moved to Canada"
-    )
-
-    assert extract_address(text) == ""
-    assert not looks_like_address(bad_address)
-
-
-def test_extract_address_rejects_review_prose_with_campus_and_india() -> None:
-    text = """
-    MR TRINETRA BHUSHAN
-    SMIT is one of the reputed colleges in India.
-    It is safe campus.
-    Quality education is provided here.
-    Everybody gets equal chance to be placed in industries.
-    Anmolika Yashashwini
-    """
-
-    bad_address = (
-        "MR TRINETRA BHUSHAN SMIT is one of the reputed colleges in India. It is safe campus. "
-        "Quality education is provided here. Everybody gets equal chance to be placed in industries. "
-        "Anmolika Yashashwini"
-    )
-
-    assert extract_address(text) == ""
-    assert not looks_like_address(bad_address)
 
 
 def test_infer_names_uses_known_section_path_for_smit() -> None:

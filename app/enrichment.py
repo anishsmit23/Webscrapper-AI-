@@ -30,6 +30,9 @@ except Exception:  # pragma: no cover - dependency may be absent in local smoke 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+_gemini_client: Any | None = None
+_gemini_client_api_key = ""
+
 SCHEMA_KEYS = [
     "website_name",
     "company_name",
@@ -53,7 +56,7 @@ HEADERS = {
 
 IMPORTANT_PATTERNS = {
     "contact": ["contact", "support", "reach-us", "get-in-touch", "admission", "admissions", "enquiry", "enquiries"],
-    "about": ["about", "company", "who-we-are", "our-story"],
+    "about": ["about", "company", "who-we-are", "our-story", "overview"],
     "services": [
         "services",
         "solutions",
@@ -64,11 +67,19 @@ IMPORTANT_PATTERNS = {
         "features",
         "marketplace",
         "pricing",
+        "placements",
+        "placement",
+        "departments",
+        "faculty",
+        "programs",
+        "courses",
+        "academics",
     ],
 }
 
 FALLBACK_PATHS = [
     "about",
+    "about-us",
     "company",
     "contact",
     "contact-us",
@@ -86,6 +97,14 @@ FALLBACK_PATHS = [
     "pricing",
     "customers",
     "industries",
+    "placements",
+    "placement",
+    "departments",
+    "faculty",
+    "programs",
+    "courses",
+    "campus-life",
+    "academics",
 ]
 
 TIE_PRIORITY = {
@@ -397,6 +416,26 @@ def clean_text(html: str) -> tuple[str, str]:
     return "\n".join(lines[:700]), title
 
 
+def is_thin_content(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if len(cleaned) < 180:
+        return True
+    words = re.findall(r"[A-Za-z]{3,}", cleaned)
+    unique_words = {word.lower() for word in words}
+    if len(words) < 35 or len(unique_words) < 20:
+        return True
+    js_shell_markers = [
+        "enable javascript",
+        "requires javascript",
+        "app-root",
+        "loading",
+        "please wait",
+    ]
+    lowered = cleaned.lower()
+    marker_hits = sum(1 for marker in js_shell_markers if marker in lowered)
+    return marker_hits >= 2 and len(words) < 80
+
+
 def page_kind(url: str, is_home: bool = False) -> str:
     if is_home:
         return "home"
@@ -504,7 +543,7 @@ def scrape_site(url: str, deadline: float) -> tuple[list[Page], str]:
         return ([reader_page] if reader_page else []), normalized
     final_url = response.url.rstrip("/")
     home_text, home_title = clean_text(response.text)
-    if len(home_text) < 120:
+    if len(home_text) < 120 or is_thin_content(home_text):
         reader_page = fetch_reader_page(final_url, "home", deadline)
         if reader_page:
             home_text = "\n".join([home_text, reader_page.text]).strip()
@@ -515,12 +554,14 @@ def scrape_site(url: str, deadline: float) -> tuple[list[Page], str]:
             continue
         if time.monotonic() >= deadline:
             break
+        # Safe to use time.sleep here: scrape_site is invoked from enrich_company
+        # which runs in a thread pool (via asyncio.to_thread in main.py)
         time.sleep(0.25)
         page_response = fetch_url(page_url, deadline, timeout=8)
         if not page_response or "text/html" not in page_response.headers.get("content-type", "text/html"):
             continue
         text, title = clean_text(page_response.text)
-        if len(text) < 120:
+        if len(text) < 120 or is_thin_content(text):
             reader_page = fetch_reader_page(page_response.url.rstrip("/"), kind, deadline)
             if reader_page:
                 text = "\n".join([text, reader_page.text]).strip()
@@ -543,6 +584,17 @@ def organization_tokens(final_url: str, company_name: str = "") -> list[str]:
         acronym = "".join(word[0] for word in name_words if word)
         if len(acronym) >= 3:
             tokens.append(acronym)
+    # For multi-level TLDs like .edu.in, .ac.in, .ac.uk, include subdomain parts
+    host = parsed.netloc.replace("www.", "").lower()
+    host_parts = host.split(".")
+    if len(host_parts) >= 3:  # e.g., smu.edu.in -> ['smu', 'edu', 'in']
+        for hp in host_parts[:-2]:  # everything before the TLD pair
+            if len(hp) >= 3 and hp not in tokens:
+                tokens.append(hp)
+    elif len(host_parts) >= 2:
+        stem = host_parts[0]
+        if len(stem) >= 3 and stem not in tokens:
+            tokens.append(stem)
     return list(dict.fromkeys(tokens))
 
 
@@ -561,6 +613,13 @@ def extract_emails(text: str, final_url: str = "", company_name: str = "") -> li
     host = urlparse(final_url).netloc.replace("www.", "").lower()
     tokens = organization_tokens(final_url, company_name)
 
+    # Build a set of domain roots for matching multi-level TLDs
+    # e.g., for host="smu.edu.in" -> domain_roots = {"smu.edu.in", "edu.in"}
+    host_parts = host.split(".")
+    domain_roots: set[str] = set()
+    for i in range(len(host_parts)):
+        domain_roots.add(".".join(host_parts[i:]))
+
     org_specific = []
     for email in cleaned:
         local, domain = email.rsplit("@", 1)
@@ -576,7 +635,16 @@ def extract_emails(text: str, final_url: str = "", company_name: str = "") -> li
         domain = email.rsplit("@", 1)[1]
         if domain in freemail:
             continue
-        if host and (domain == host or domain.endswith("." + host) or host.endswith("." + domain)):
+        # Match if email domain shares any root with the site host
+        # e.g., admissions@smu.edu.in matches host smu.edu.in
+        # e.g., info@smit.smu.edu.in matches host smu.edu.in
+        if host and (
+            domain == host
+            or domain.endswith("." + host)
+            or host.endswith("." + domain)
+            or domain in domain_roots
+            or any(domain.endswith("." + root) for root in domain_roots if len(root) > 5)
+        ):
             official.append(email)
     if official:
         return official[:5]
@@ -603,111 +671,6 @@ def extract_phones(text: str) -> list[str]:
     return phones[:3]
 
 
-def extract_address(text: str) -> str:
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    address_words = re.compile(
-        r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|building|"
-        r"campus|mile|city|state|zip|postal|pin|pincode|india|usa|"
-        r"united states|canada|australia)\b",
-        re.I,
-    )
-    location_words = re.compile(
-        r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|building|"
-        r"campus|mile|near|post|po|district|dist\.|city|state|zip|postal|pin|pincode|"
-        r"india|usa|united states|canada|australia)\b",
-        re.I,
-    )
-    phone_or_support = re.compile(r"\b(toll free|phone|fax|call|tel|mobile|email|@)\b", re.I)
-    non_address = re.compile(
-        r"\b(accreditation|assessment|ranked|ranking|universities ranked|top private|"
-        r"admissions?|programs?|courses?|placement|download|apply now|copyright|"
-        r"medical|nursing|physiotherapy|allied health|biotechnology|hospital administration|"
-        r"humanities|liberal arts)\b",
-        re.I,
-    )
-    prose_or_testimonial = re.compile(
-        r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
-        r"testimonial|alumni|experience|career|subjects?|reputed colleges?|quality education|"
-        r"safe campus|equal chance|placed in industries|everybody gets|placed|industries)\b",
-        re.I,
-    )
-
-    def clean_candidate(value: str) -> str:
-        value = re.sub(r"^(?:address|head office|registered office|corporate office)\s*[:.-]?\s*", "", value, flags=re.I)
-        value = re.sub(r"^(?:\+?\d[\d\s().-]{7,}\d\s*)+", "", value).strip(" :-,")
-        value = re.sub(r"(?:phone|mobile|tel|call)\s*[:.-]?\s*\+?\d[\d\s().-]{7,}\d", "", value, flags=re.I)
-        value = re.sub(r"\+?\d[\d\s().-]{7,}\d", "", value)
-        return re.sub(r"\s+", " ", value).strip(" :-,")
-
-    def score_candidate(value: str) -> int:
-        candidate = clean_candidate(value)
-        if len(candidate) < 18 or len(candidate) > 320:
-            return 0
-        if phone_or_support.search(candidate) and len(re.findall(r"\d", candidate)) >= 7:
-            return 0
-        word_count = len(re.findall(r"[A-Za-z]+", candidate))
-        if prose_or_testimonial.search(candidate) and word_count > 10:
-            return 0
-        strong_location = bool(
-            re.search(
-                r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|"
-                r"building|campus|mile|near|post|po|district|dist\.|pin|pincode|postal)\b",
-                candidate,
-                re.I,
-            )
-            or re.search(r"\b\d{5,6}\b", candidate)
-        )
-        country_with_structure = bool(
-            "," in candidate
-            and re.search(r"\b(india|usa|united states|canada|australia)\b", candidate, re.I)
-            and word_count <= 18
-        )
-        if not strong_location and not country_with_structure:
-            return 0
-        if non_address.search(candidate) and not strong_location:
-            return 0
-        if re.search(r"\([^)]{35,}\)", candidate) and non_address.search(candidate):
-            return 0
-        score = 0
-        score += 35 if location_words.search(candidate) else 0
-        score += 20 if re.search(r"\b\d{5,6}\b", candidate) else 0
-        score += 15 if re.search(r"\b(india|usa|united states|canada|australia)\b", candidate, re.I) else 0
-        score += 12 if "," in candidate else 0
-        score += 10 if re.search(r"\b(address|office|campus)\b", value, re.I) else 0
-        score -= 45 if non_address.search(candidate) else 0
-        return score
-
-    candidates: list[tuple[int, str]] = []
-    for idx, line in enumerate(lines):
-        if re.search(r"\b(address|head office|registered office|corporate office)\b", line, re.I):
-            parts: list[str] = []
-            for candidate in lines[idx : idx + 6]:
-                digit_count = len(re.findall(r"\d", candidate))
-                if phone_or_support.search(candidate) and digit_count >= 7:
-                    break
-                if re.search(r"\b(email|phone|mobile|call|fax)\b", candidate, re.I):
-                    break
-                parts.append(candidate)
-            address = " ".join(parts).strip(" :-,")
-            score = score_candidate(address)
-            if score:
-                candidates.append((score + 20, clean_candidate(address)[:300]))
-        window = " ".join(lines[idx : idx + 3])
-        digit_count = len(re.findall(r"\d", window))
-        if phone_or_support.search(window) and digit_count >= 7:
-            continue
-        if len(re.findall(r"\d[\d\s().+-]{6,}\d", window)) >= 2:
-            continue
-        if len(window) > 35 and address_words.search(window):
-            score = score_candidate(window)
-            if score:
-                candidates.append((score, clean_candidate(window)[:250]))
-    if candidates:
-        candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
-        return candidates[0][1]
-    return ""
-
-
 def valid_email_list(value: Any) -> list[str]:
     raw_values = value if isinstance(value, list) else [value]
     emails: list[str] = []
@@ -722,48 +685,6 @@ def valid_email_list(value: Any) -> list[str]:
 def valid_phone(value: Any) -> str:
     phones = extract_phones(str(value or ""))
     return phones[0] if phones else ""
-
-
-def looks_like_address(value: Any) -> bool:
-    address = str(value or "").strip()
-    if len(address) < 18:
-        return False
-    if re.search(r"@", address):
-        return False
-    if re.search(
-        r"\b(accreditation|assessment|ranked|ranking|top private|download|apply now|"
-        r"medical|nursing|physiotherapy|allied health|biotechnology|hospital administration|"
-        r"humanities|liberal arts)\b",
-        address,
-        re.I,
-    ):
-        return False
-    if re.search(r"\+?\d[\d\s().-]{7,}\d", address):
-        return False
-    word_count = len(re.findall(r"[A-Za-z]+", address))
-    if re.search(
-        r"\b(i|me|my|we|our|student|students|taught|received|moved|stand out|field|"
-        r"testimonial|alumni|experience|career|subjects?|reputed colleges?|quality education|"
-        r"safe campus|equal chance|placed in industries|everybody gets|placed|industries)\b",
-        address,
-        re.I,
-    ) and word_count > 10:
-        return False
-    strong_location = bool(
-        re.search(
-            r"\b(street|st\.|road|rd\.|avenue|ave\.|lane|building|campus|mile|"
-            r"pin|pincode|postal)\b",
-            address,
-            re.I,
-        )
-        or re.search(r"\b\d{5,6}\b", address)
-    )
-    country_with_structure = bool(
-        "," in address
-        and re.search(r"\b(india|usa|united states|canada|australia)\b", address, re.I)
-        and word_count <= 18
-    )
-    return strong_location or country_with_structure
 
 
 def acronym_for_name(name: str) -> str:
@@ -1223,6 +1144,14 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     return {}
 
 
+def _get_gemini_client(api_key: str):
+    global _gemini_client, _gemini_client_api_key
+    if _gemini_client is None or _gemini_client_api_key != api_key:
+        _gemini_client = genai.Client(api_key=api_key)
+        _gemini_client_api_key = api_key
+    return _gemini_client
+
+
 def call_gemini(context: str, facts: dict[str, Any], deadline: float) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or genai is None or time.monotonic() >= deadline:
@@ -1234,15 +1163,18 @@ thought_process, website_name, company_name, address, mobile_number, mail, core_
 
 Hard rules:
 - thought_process: Use this field first to reason step-by-step about the company's true business model, target audience scale (local vs national/global), and to find the most accurate contact details.
-- Contact Details (mail, mobile_number, address): Use the 'Factual extraction' below as a strong baseline. However, if the factual extraction is missing data, or clearly captured a random sentence instead of an address, you MUST extract the correct details directly from the provided 'Cleaned website text'. Do not invent or hallucinate; only extract what is visibly present.
+- Contact Details (mail, mobile_number, address): Use the 'Factual extraction' below as a strong baseline. However, if the factual extraction is missing data, or clearly captured a random sentence instead of an address (e.g., a testimonial or quote), you MUST extract the correct details directly from the provided 'Cleaned website text'. Do not invent or hallucinate; only extract what is visibly present.
+- address: Must be a PHYSICAL ADDRESS ONLY (street, city, state, pin code). NEVER include testimonials, quotes, reviews, person names, or descriptive prose. If no physical address is found, use "".
 - If a contact field is truly absent, use "" or []. mail must be an array of strings.
 - First identify the organization type: education, logistics, healthcare, finance, software, AI/data, etc.
 - If the site is a college, university, institute, school, admissions page, or campus page, classify it as education even if it mentions AI, data science, engineering, or software courses.
 - Do not classify a business as AI/data just because AI appears as a course, department, blog topic, client use case, or incidental phrase.
-- core_service: Name actual programs, departments, services, specializations, industries, or products visible on the site. Never write generic industry descriptions.
-- target_customer: Identify the TRUE target customer. Do NOT artificially restrict the geography to the organization's physical address unless they are a strictly local business (e.g., a local plumber or restaurant). For universities, software companies, logistics, and digital services, the audience is usually national or global. Be specific about the buyer/user profile based on visible content.
-- probable_pain_point: Must be specific to this organization's niche, geography, positioning, or offering. Generic statements like "choosing the right program" are not acceptable.
-- outreach_opener: Must reference one concrete detail from the website such as a program, location, placement/admissions theme, service, product, industry, or stated goal. Do not use vague phrases like "I would love to share an idea"; offer a concrete relevant value. Must be concise, specific, and must not include fake metrics or unsupported claims.
+
+IMPORTANT — Field-specific quality requirements:
+- core_service: List the SPECIFIC programs, departments, specializations, or services this particular organization offers. For education sites, name the actual degree programs (B.Tech CSE, M.Tech, MBA, etc.), departments, and any unique specializations visible on the site. NEVER use generic descriptions like "undergraduate and postgraduate programs" — be specific to THIS institution.
+- target_customer: Identify the TRUE target customer based on visible content. For education: what type of students (engineering aspirants, MBA candidates, etc.), from which regions, at what career stage. For businesses: specific buyer profiles. Do NOT artificially restrict geography to the physical location.
+- probable_pain_point: Must be SPECIFIC to this exact organization. Reference their unique positioning, competitors, geography, or market challenges. For example, for a Northeast India institute: "Competing against metro-based IITs/NITs for top engineering talent while showcasing strong placement records and campus infrastructure." NEVER use generic statements.
+- outreach_opener: MUST reference at least one CONCRETE detail from the scraped website — a specific program name, placement statistic, campus feature, service offering, or stated goal. Must read like a personalized message, not a template. Must be concise and must not include fake metrics.
 
 Factual extraction:
 {json.dumps(facts, ensure_ascii=False)}
@@ -1250,27 +1182,38 @@ Factual extraction:
 Cleaned website text:
 {context}
 """
-    try:
-        remaining = min(8, int(deadline - time.monotonic()))
-        if remaining <= 0:
+    client = _get_gemini_client(api_key)
+    
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 3:
+            logger.warning("Not enough time remaining for Gemini call (attempt %d).", attempt)
             return {}
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.2,
-                response_mime_type="application/json",
-            ),
-        )
-        return parse_json_object(getattr(response, "text", ""))
-    except (ValueError, TypeError, KeyError) as exc:
-        logger.warning("Gemini response parsing error: %s", exc)
-        return {}
-    except Exception:
-        logger.exception("Gemini enrichment call failed")
-        return {}
-
+            
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            parsed = parse_json_object(getattr(response, "text", ""))
+            if parsed:
+                return parsed
+            logger.warning("Gemini returned unparseable text on attempt %d", attempt)
+        except Exception as exc:
+            logger.warning("Gemini API call failed on attempt %d: %s", attempt, exc)
+            
+        if attempt < attempts:
+            backoff = min(2 ** (attempt - 1), int(deadline - time.monotonic()) - 3)
+            if backoff > 0:
+                time.sleep(backoff)
+                
+    logger.error("Gemini enrichment failed after %d attempts", attempts)
+    return {}
 
 def stable_profile(data: dict[str, Any]) -> dict[str, Any]:
     profile = {key: data.get(key, [] if key == "mail" else "") for key in SCHEMA_KEYS}
@@ -1315,9 +1258,9 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
             return stable_profile(profile)
 
         all_text = "\n".join([final_url, website_name, *[page.text for page in pages]])
+        # Contact pages usually contain the most direct phone listings, so prefer them before falling back.
         contact_text = "\n".join(page.text for page in pages if page.kind == "contact") or all_text
         phones = extract_phones(contact_text)
-        address = extract_address(contact_text)
         inferred_website_name, inferred_company_name = infer_names(pages, final_url)
         display_company_name = inferred_company_name
         if website_name.strip() and " " in website_name.strip() and " " not in inferred_company_name:
@@ -1327,7 +1270,7 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
         facts = {
             "website_name": website_name.strip() or inferred_website_name,
             "company_name": display_company_name,
-            "address": address,
+            "address": "",  # Delegated fully to Gemini
             "mobile_number": phones[0] if phones else "",
             "mail": emails,
             "source_url": final_url,
@@ -1335,7 +1278,26 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
         profile.update(facts)
         ai_data = call_gemini(compact_context(pages), facts, deadline)
         fallback_insights = local_business_insights(all_text, display_company_name)
-        merged = {**profile, **ai_data}
+        merged = {**profile}
+
+        # For insight fields, prefer Gemini's specific output over hardcoded templates
+        insight_keys = {"core_service", "target_customer", "probable_pain_point", "outreach_opener"}
+        for key in insight_keys:
+            ai_value = str(ai_data.get(key) or "").strip()
+            fallback_value = str(fallback_insights.get(key) or "").strip()
+            # Use Gemini output if it's substantive (longer than 20 chars, not empty)
+            if ai_value and len(ai_value) > 20:
+                merged[key] = ai_value
+            elif fallback_value:
+                merged[key] = fallback_value
+
+        # For non-insight fields, apply AI data normally
+        for key, value in ai_data.items():
+            if key not in insight_keys and key != "thought_process" and value:
+                if key not in merged or not merged.get(key):
+                    merged[key] = value
+
+        # Fill remaining gaps from fallback insights
         for key, value in fallback_insights.items():
             if value and not merged.get(key):
                 merged[key] = value
@@ -1346,12 +1308,13 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
 
         merged["mail"] = emails or ai_emails
         merged["mobile_number"] = phones[0] if phones else ai_phone
-        if looks_like_address(address):
-            merged["address"] = address
-        elif looks_like_address(ai_address):
-            merged["address"] = ai_address[:300]
+        
+        # Sanity check Gemini's address (non-empty, sane length, no email addresses)
+        if ai_address and len(ai_address) < 300 and "@" not in ai_address:
+            merged["address"] = ai_address
         else:
             merged["address"] = ""
+            
         merged["website_name"] = website_name.strip() or merged.get("website_name") or inferred_website_name
         merged["company_name"] = merged.get("company_name") or display_company_name
         repair_education_profile(merged, all_text)
