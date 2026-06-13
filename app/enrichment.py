@@ -52,7 +52,7 @@ HEADERS = {
 }
 
 IMPORTANT_PATTERNS = {
-    "contact": ["contact", "support", "reach-us", "get-in-touch"],
+    "contact": ["contact", "support", "reach-us", "get-in-touch", "admission", "admissions", "enquiry", "enquiries"],
     "about": ["about", "company", "who-we-are", "our-story"],
     "services": [
         "services",
@@ -71,6 +71,12 @@ FALLBACK_PATHS = [
     "about",
     "company",
     "contact",
+    "contact-us",
+    "admission",
+    "admissions",
+    "admissions/contact-us",
+    "admission/contact-us",
+    "enquiry",
     "support",
     "services",
     "solutions",
@@ -183,7 +189,7 @@ def prettify_company_name(name: str) -> str:
         "healthcare",
     ]
     for suffix in known_suffixes:
-        if compact.endswith(suffix) and len(compact) > len(suffix) + 2:
+        if " " not in raw and compact.endswith(suffix) and len(compact) > len(suffix) + 2:
             prefix = compact[: -len(suffix)]
             if prefix == "omsai":
                 prefix = "om sai"
@@ -444,8 +450,12 @@ def discover_from_home(home_url: str, home_html: str) -> list[str]:
         if parsed.netloc == parsed_home.netloc:
             urls.append(absolute)
     base = f"{parsed_home.scheme}://{parsed_home.netloc}"
+    section_parts = [part for part in parsed_home.path.strip("/").split("/") if part]
+    section_base = urljoin(base + "/", section_parts[0] + "/") if section_parts else ""
     for path in FALLBACK_PATHS:
         urls.append(urljoin(base + "/", path))
+        if section_base:
+            urls.append(urljoin(section_base, path))
     return list(dict.fromkeys(urls))[:120]
 
 
@@ -597,7 +607,7 @@ def extract_address(text: str) -> str:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     address_words = re.compile(
         r"\b(street|st\.|road|rd\.|avenue|ave\.|drive|dr\.|lane|ln\.|suite|floor|building|"
-        r"campus|mile|tadong|gangtok|sikkim|city|state|zip|postal|pin|pincode|india|usa|"
+        r"campus|mile|city|state|zip|postal|pin|pincode|india|usa|"
         r"united states|canada|australia)\b",
         re.I,
     )
@@ -610,13 +620,17 @@ def extract_address(text: str) -> str:
     phone_or_support = re.compile(r"\b(toll free|phone|fax|call|tel|mobile|email|@)\b", re.I)
     non_address = re.compile(
         r"\b(accreditation|assessment|ranked|ranking|universities ranked|top private|"
-        r"admissions?|programs?|courses?|placement|download|apply now|copyright)\b",
+        r"admissions?|programs?|courses?|placement|download|apply now|copyright|"
+        r"medical|nursing|physiotherapy|allied health|biotechnology|hospital administration|"
+        r"humanities|liberal arts)\b",
         re.I,
     )
 
     def clean_candidate(value: str) -> str:
         value = re.sub(r"^(?:address|head office|registered office|corporate office)\s*[:.-]?\s*", "", value, flags=re.I)
         value = re.sub(r"^(?:\+?\d[\d\s().-]{7,}\d\s*)+", "", value).strip(" :-,")
+        value = re.sub(r"(?:phone|mobile|tel|call)\s*[:.-]?\s*\+?\d[\d\s().-]{7,}\d", "", value, flags=re.I)
+        value = re.sub(r"\+?\d[\d\s().-]{7,}\d", "", value)
         return re.sub(r"\s+", " ", value).strip(" :-,")
 
     def score_candidate(value: str) -> int:
@@ -635,6 +649,8 @@ def extract_address(text: str) -> str:
             or re.search(r"\b\d{5,6}\b", candidate)
         )
         if non_address.search(candidate) and not strong_location:
+            return 0
+        if re.search(r"\([^)]{35,}\)", candidate) and non_address.search(candidate):
             return 0
         score = 0
         score += 35 if location_words.search(candidate) else 0
@@ -698,12 +714,20 @@ def looks_like_address(value: Any) -> bool:
         return False
     if re.search(r"@", address):
         return False
-    if re.search(r"\b(accreditation|assessment|ranked|ranking|top private|download|apply now)\b", address, re.I):
+    if re.search(
+        r"\b(accreditation|assessment|ranked|ranking|top private|download|apply now|"
+        r"medical|nursing|physiotherapy|allied health|biotechnology|hospital administration|"
+        r"humanities|liberal arts)\b",
+        address,
+        re.I,
+    ):
+        return False
+    if re.search(r"\+?\d[\d\s().-]{7,}\d", address):
         return False
     return bool(
         re.search(
-            r"\b(street|st\.|road|rd\.|avenue|ave\.|lane|building|campus|mile|tadong|gangtok|"
-            r"sikkim|pin|pincode|postal|india|usa|united states|canada|australia)\b",
+            r"\b(street|st\.|road|rd\.|avenue|ave\.|lane|building|campus|mile|"
+            r"pin|pincode|postal|india|usa|united states|canada|australia)\b",
             address,
             re.I,
         )
@@ -711,9 +735,37 @@ def looks_like_address(value: Any) -> bool:
     )
 
 
+def acronym_for_name(name: str) -> str:
+    stopwords = {"of", "and", "the", "for", "in", "at", "by"}
+    words = [word for word in re.findall(r"[A-Za-z]+", name or "") if word.lower() not in stopwords]
+    return "".join(word[0] for word in words).lower()
+
+
+def organization_name_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    pattern = re.compile(
+        r"\b([A-Z][A-Za-z&.'-]*(?:\s+(?:of|and|the|for|in|at|[A-Z][A-Za-z&.'-]*)){1,9}"
+        r"\s+(?:University|Institute|College|School|Technologies|Technology|Solutions|Services|"
+        r"Packers|Movers|Logistics|Healthcare|Hospital|Agency|Studio|Pte\.?\s*Ltd\.?|Pvt\.?\s*Ltd\.?|Ltd\.?))\b"
+    )
+    for line in (text or "").splitlines():
+        for match in pattern.finditer(line):
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" :-|")
+            if 5 <= len(candidate) <= 90 and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
 def infer_names(pages: list[Page], final_url: str) -> tuple[str, str]:
     candidates: list[tuple[int, str]] = []
     domain_name = name_from_domain(final_url)
+    path_tokens = [token.lower() for token in urlparse(final_url).path.split("/") if token]
+    page_text = "\n".join([page.title + "\n" + page.text for page in pages])
+    for org_name in organization_name_candidates(page_text):
+        if any(token == acronym_for_name(org_name) for token in path_tokens if len(token) >= 3):
+            candidates.append((115, org_name))
+        else:
+            candidates.append((35, org_name))
     for page in pages:
         if page.title:
             parts = [
@@ -725,13 +777,15 @@ def infer_names(pages: list[Page], final_url: str) -> tuple[str, str]:
                 score = 60 if domain_name and part.lower() == domain_name.lower() else 25
                 candidates.append((score, part))
         soup = BeautifulSoup(page.html, "html.parser")
-        for selector in ["meta[property='og:site_name']", "meta[name='application-name']"]:
+        for selector in ["meta[property='og:site_name']", "meta[name='application-name']", "meta[property='og:title']"]:
             tag = soup.select_one(selector)
             if tag and tag.get("content"):
                 candidates.append((80, tag["content"].strip()))
-        h1 = soup.find("h1")
-        if h1:
-            candidates.append((10, h1.get_text(" ", strip=True)))
+        for selector, score in [("h1", 45), (".site-title", 40), (".logo", 35), ("header", 15)]:
+            for tag in soup.select(selector)[:3]:
+                text = tag.get_text(" ", strip=True)
+                if text:
+                    candidates.append((score, text))
     candidates.append((50, domain_name))
     marketing_words = re.compile(
         r"\b(train|deploy|leading|industry|solutions|services|platform|software|data|ai|"
@@ -739,8 +793,11 @@ def infer_names(pages: list[Page], final_url: str) -> tuple[str, str]:
         re.I,
     )
     for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+        candidate = re.sub(r"\b(?:home|contact us|admissions?|about us)\b", "", candidate, flags=re.I)
         candidate = prettify_company_name(re.sub(r"\s+", " ", candidate).strip())
-        if 2 < len(candidate) <= 40 and not marketing_words.search(candidate):
+        if 2 < len(candidate) <= 80 and not marketing_words.search(candidate):
+            if candidate.lower() == domain_name.lower() and len(candidate) <= 4:
+                continue
             return candidate, candidate
     return domain_name, domain_name
 
@@ -779,9 +836,6 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         )
         locations = visible_terms(
             [
-                (r"\bsikkim\b", "Sikkim"),
-                (r"\bmajitar\b", "Majitar"),
-                (r"\beast sikkim\b", "East Sikkim"),
                 (r"\bnorth[- ]?east\b|\bnortheast\b", "Northeast India"),
                 (r"\bindia\b", "India"),
             ],
@@ -790,23 +844,22 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
         service_focus = ", ".join(programs[:4]) if programs else "academic programs"
         location_focus = f" at {', '.join(locations[:2])}" if locations else ""
         service = f"Undergraduate and postgraduate education in {service_focus}{location_focus}."
-        customer = "Prospective students"
-        if locations:
-            customer += f" from {', '.join(locations[:2])}"
-        customer += " evaluating academic and career-oriented programs"
+        customer = "Prospective undergraduate and postgraduate students across India"
+        if has_pattern(r"\binternational\b|\bnri\b|\bforeign students?\b"):
+            customer += " and internationally"
+        customer += " evaluating academic, career-oriented, and campus-based programs"
         if programs:
             customer += f" such as {', '.join(programs[:3])}"
         customer += "."
         pain = (
-            f"Finding credible {service_focus} programs"
-            + (f" in {', '.join(locations[:2])}" if locations else "")
-            + " while comparing admissions, placement outcomes, campus quality, and career fit."
+            f"Comparing credible {service_focus} options while understanding admissions requirements, "
+            "placement outcomes, campus life, fees, and long-term career fit."
         )
         detail = "placement outcomes" if re.search(r"\bplacements?\b", lowered) else "admissions information"
         opener = (
             f"Hi {company_name} team, I noticed your site emphasizes {detail}"
             + (f" for programs like {', '.join(programs[:2])}" if programs else "")
-            + ". A relevant opportunity would be improving how prospective students discover the right program and complete the admissions journey."
+            + ". A relevant opportunity would be making program discovery, admissions enquiries, and counselling follow-up clearer for students comparing institutes across India."
         )
         return {
             "service": service,
@@ -1068,6 +1121,55 @@ def local_business_insights(text: str, company_name: str) -> dict[str, str]:
     }
 
 
+def is_education_site(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(university|institute|college|school|campus|admissions?|degree|faculty|"
+            r"b\.?\s*tech|m\.?\s*tech|mba|mca|ph\.?\s*d)\b",
+            text or "",
+            re.I,
+        )
+    )
+
+
+def repair_education_profile(profile: dict[str, Any], source_text: str) -> None:
+    if not is_education_site(source_text):
+        return
+    target = str(profile.get("target_customer") or "")
+    local_overfit = re.search(r"\bstudents?\s+from\s+[^.]{3,80}", target, re.I) and not re.search(
+        r"\b(across|national|international|global|worldwide|all over)\b",
+        target,
+        re.I,
+    )
+    if local_overfit or not target:
+        programs = []
+        for pattern, label in [
+            (r"\bb\.?\s*tech\b", "B.Tech"),
+            (r"\bm\.?\s*tech\b", "M.Tech"),
+            (r"\bmba\b", "MBA"),
+            (r"\bmca\b", "MCA"),
+            (r"\bph\.?\s*d\b", "Ph.D."),
+        ]:
+            if re.search(pattern, source_text, re.I) and label not in programs:
+                programs.append(label)
+        suffix = f" such as {', '.join(programs[:3])}" if programs else ""
+        profile["target_customer"] = (
+            "Prospective undergraduate and postgraduate students across India evaluating "
+            f"academic, career-oriented, and campus-based programs{suffix}."
+        )
+    pain = str(profile.get("probable_pain_point") or "")
+    localized_program_pain = re.search(r"\bprograms?\s+in\s+[^,.]{3,80}", pain, re.I) and not re.search(
+        r"\b(india|national|international|global|worldwide|online)\b",
+        pain,
+        re.I,
+    )
+    if localized_program_pain:
+        profile["probable_pain_point"] = (
+            "Comparing credible programs while understanding admissions requirements, placement outcomes, "
+            "campus life, fees, and long-term career fit."
+        )
+
+
 def parse_json_object(raw: str) -> dict[str, Any]:
     if not raw:
         return {}
@@ -1217,6 +1319,7 @@ def enrich_company(url: str, website_name: str = "", total_timeout: int = 20) ->
             merged["address"] = ""
         merged["website_name"] = website_name.strip() or merged.get("website_name") or inferred_website_name
         merged["company_name"] = merged.get("company_name") or display_company_name
+        repair_education_profile(merged, all_text)
         return stable_profile(merged)
     except ValueError as exc:
         logger.warning("URL validation or parsing error for %s: %s", url, exc)

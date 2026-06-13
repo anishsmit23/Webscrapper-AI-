@@ -1,4 +1,14 @@
-from app.enrichment import clean_text, extract_address, extract_emails, looks_like_address
+from app.enrichment import (
+    Page,
+    clean_text,
+    discover_from_home,
+    extract_address,
+    extract_emails,
+    infer_names,
+    local_business_insights,
+    looks_like_address,
+    repair_education_profile,
+)
 
 
 def test_clean_text_preserves_mailto_and_tel_links() -> None:
@@ -46,3 +56,77 @@ def test_extract_address_rejects_ranking_sentence() -> None:
     assert not looks_like_address(
         "National Assessment and Accreditation Council Top Private Universities Ranked in India"
     )
+
+
+def test_extract_address_rejects_program_label_mixed_with_phone() -> None:
+    text = """
+    Contact
+    Tadong Campus ( Medical, Nursing, Physiotherapy, Allied Health, Biotechnology,
+    Hospital Administration, Humanities Social Sciences and Liberal Arts ) +91 90836 18855
+    """
+
+    assert extract_address(text) == ""
+    assert not looks_like_address(
+        "Tadong Campus ( Medical, Nursing, Physiotherapy, Allied Health, Biotechnology, Hospital Administration, Humanities Social Sciences and Liberal Arts ) +91 90836 18855"
+    )
+
+
+def test_infer_names_uses_known_section_path_for_smit() -> None:
+    pages = [
+        Page(
+            url="https://www.smu.edu.in/smit/",
+            kind="home",
+            html="<html><title>SMIT | Sikkim Manipal University</title><h1>Welcome</h1></html>",
+            text="Sikkim Manipal Institute of Technology offers B.Tech M.Tech MBA MCA admissions",
+            title="SMIT | Sikkim Manipal University",
+        )
+    ]
+
+    _, company_name = infer_names(pages, "https://www.smu.edu.in/smit/")
+
+    assert company_name == "Sikkim Manipal Institute Of Technology"
+
+
+def test_infer_names_does_not_invent_unknown_acronym_expansion() -> None:
+    pages = [
+        Page(
+            url="https://example.edu/abcd/",
+            kind="home",
+            html="<html><title>ABCD | Example University</title><h1>Welcome</h1></html>",
+            text="Admissions campus degree programs",
+            title="ABCD | Example University",
+        )
+    ]
+
+    _, company_name = infer_names(pages, "https://example.edu/abcd/")
+
+    assert company_name != "Sikkim Manipal Institute Of Technology"
+
+
+def test_discover_from_home_adds_section_fallback_paths() -> None:
+    urls = discover_from_home("https://www.smu.edu.in/smit/", "<html></html>")
+
+    assert "https://www.smu.edu.in/smit/contact-us" in urls
+    assert "https://www.smu.edu.in/smit/admissions" in urls
+
+
+def test_education_fallback_does_not_localize_students_to_campus() -> None:
+    text = "Sikkim Majitar B.Tech M.Tech MBA admissions placements campus"
+
+    insights = local_business_insights(text, "Sikkim Manipal Institute Of Technology")
+
+    assert "across India" in insights["target_customer"]
+    assert "from Sikkim" not in insights["target_customer"]
+
+
+def test_repair_education_profile_removes_local_overfit() -> None:
+    profile = {
+        "target_customer": "Prospective students from Sikkim, Majitar evaluating B.Tech programs.",
+        "probable_pain_point": "Finding credible B.Tech programs in Sikkim, Majitar.",
+    }
+
+    repair_education_profile(profile, "University campus admissions B.Tech M.Tech MBA placement")
+
+    assert "across India" in profile["target_customer"]
+    assert "from Sikkim" not in profile["target_customer"]
+    assert "in Sikkim" not in profile["probable_pain_point"]

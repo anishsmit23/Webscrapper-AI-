@@ -1,12 +1,3 @@
-"""SQLite storage for enriched company profiles.
-
-Repairs applied:
-- #9  Single shared connection with WAL mode + threading lock for writes
-- #10 Duplicate detection — skip re-insert if same URL was enriched within 24h
-- #11 Pagination support via limit/offset
-- #15 Structured logging
-"""
-
 from __future__ import annotations
 
 import json
